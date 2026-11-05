@@ -1,2 +1,2 @@
 # Bonds-of-Skyrim
-sim lik interaction
+sims like interaction
