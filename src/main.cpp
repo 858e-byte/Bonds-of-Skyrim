@@ -30,12 +30,21 @@
 
 #include "PrismaUI_API.h"
 
+#include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <unordered_map>
 
 namespace
 {
 	using Values = std::unordered_map<std::string, float>;
+
+	// 0.14.9 : Papyrus peut changer l'ecriture d'un mot ("on" devient "On") selon les mods charges. Une cle s'ecrit donc toujours
+	// en minuscules, sinon une valeur sauvegardee ne serait plus retrouvee si la liste de mods change.
+	void Normalize(std::string& a_key)
+	{
+		std::transform(a_key.begin(), a_key.end(), a_key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	}
 
 	std::mutex g_lock;
 	std::unordered_map<RE::FormID, Values> g_data;
@@ -139,6 +148,7 @@ namespace
 		if (!a_actor) {
 			return a_default;
 		}
+		Normalize(a_key);
 		std::scoped_lock lock(g_lock);
 		const auto it = g_data.find(a_actor->GetFormID());
 		if (it == g_data.end()) {
@@ -153,6 +163,7 @@ namespace
 		if (!a_actor) {
 			return;
 		}
+		Normalize(a_key);
 		std::scoped_lock lock(g_lock);
 		g_data[a_actor->GetFormID()][a_key] = a_value;
 	}
@@ -250,6 +261,7 @@ namespace
 					float value = 0.0f;
 					a_intfc->ReadRecordData(value);
 					if (keep) {
+						Normalize(key);  // les sauvegardes d'avant 0.14.9 ont des cles comme "est.0.0.On"
 						g_data[newId][std::move(key)] = value;
 					}
 				}
