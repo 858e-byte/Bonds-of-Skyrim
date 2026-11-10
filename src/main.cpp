@@ -31,7 +31,9 @@
 #include "PrismaUI_API.h"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
+#include <vector>
 #include <mutex>
 #include <unordered_map>
 
@@ -196,6 +198,51 @@ namespace
 		return global ? global->value : 0.0f;
 	}
 
+	// ---------------------------------------------------------------- 0.14.28 : les lits d'une maison (Estate 0.5)
+	// Un lit = un meuble dont le modele a le drapeau "Can sleep" (MNAM, bit 31) ; ses places = ses reperes actifs (bits 0-23 et 28).
+	// Regle verifiee sur Skyrim.esm hors du jeu (work\diag_beds.py) : 142 lits a une place, 9 lits doubles.
+
+	RE::TESFurniture* BedBase(RE::TESObjectREFR* a_ref)
+	{
+		if (!a_ref || a_ref->IsDisabled() || a_ref->IsDeleted()) {
+			return nullptr;
+		}
+		const auto base = a_ref->GetBaseObject();
+		const auto furniture = base ? base->As<RE::TESFurniture>() : nullptr;
+		if (!furniture || !furniture->furnFlags.all(RE::TESFurniture::ActiveMarker::kCanSleep)) {
+			return nullptr;
+		}
+		return furniture;
+	}
+
+	std::int32_t SleepSpots(RE::StaticFunctionTag*, RE::TESObjectREFR* a_ref)
+	{
+		const auto furniture = BedBase(a_ref);
+		if (!furniture) {
+			return 0;
+		}
+		const auto bits = furniture->furnFlags.underlying() & 0x10FFFFFFu;
+		return (std::max)(1, static_cast<std::int32_t>(std::popcount(bits)));
+	}
+
+	// les lits de la piece ou se tient cette personne (une cellule interieure seulement), 128 au plus
+	std::vector<RE::TESObjectREFR*> BedsHere(RE::StaticFunctionTag*, RE::Actor* a_who)
+	{
+		std::vector<RE::TESObjectREFR*> beds;
+		const auto cell = a_who ? a_who->GetParentCell() : nullptr;
+		if (!cell || !cell->IsInteriorCell()) {
+			return beds;
+		}
+		cell->ForEachReference([&](RE::TESObjectREFR* a_ref) {
+			if (BedBase(a_ref)) {
+				beds.push_back(a_ref);
+			}
+			return beds.size() < 128 ? RE::BSContainer::ForEachResult::kContinue : RE::BSContainer::ForEachResult::kStop;
+		});
+		logger::info("lits de {:08X} : {}", cell->GetFormID(), beds.size());
+		return beds;
+	}
+
 	bool RegisterFunctions(RE::BSScript::IVirtualMachine* a_vm)
 	{
 		// true : appelables sans attendre une image. Le script en fait des dizaines par conversation ; ces valeurs ont leur verrou.
@@ -208,6 +255,8 @@ namespace
 		a_vm->RegisterFunction("UIReady", "AML_Native", UIReady);
 		a_vm->RegisterFunction("OpenUI", "AML_Native", OpenUI);
 		a_vm->RegisterFunction("CloseUI", "AML_Native", CloseUI);
+		a_vm->RegisterFunction("BedsHere", "AML_Native", BedsHere);
+		a_vm->RegisterFunction("SleepSpots", "AML_Native", SleepSpots);
 		return true;
 	}
 
