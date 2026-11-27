@@ -86,6 +86,27 @@ namespace
 		}
 	}
 
+	// 0.14.62 : le texte tape dans la page arrive en UTF-8 ; le jeu ecrit ses noms en Latin-1. Les accents courants sont gardes ; le reste,
+	// les caracteres de controle et "|" (le separateur du menu) sont retires.
+	std::string ToGameText(const char* a_text)
+	{
+		std::string out;
+		if (!a_text) {
+			return out;
+		}
+		for (auto* p = reinterpret_cast<const unsigned char*>(a_text); *p && out.size() < 24; ++p) {
+			if (*p < 0x80) {
+				if (*p >= 0x20 && *p != '|') {
+					out.push_back(static_cast<char>(*p));
+				}
+			} else if ((*p == 0xC2 || *p == 0xC3) && (p[1] & 0xC0) == 0x80) {
+				out.push_back(static_cast<char>(*p == 0xC2 ? p[1] : p[1] + 0x40));
+				++p;
+			}
+		}
+		return out;
+	}
+
 	void CreateView()
 	{
 		g_prisma = static_cast<PRISMA_UI_API::IVPrismaUI1*>(PRISMA_UI_API::RequestPluginAPI(PRISMA_UI_API::InterfaceVersion::V1));
@@ -102,6 +123,12 @@ namespace
 			logger::info("la page choisit : {}", number);
 			SKSE::GetTaskInterface()->AddTask([]() { CloseView(); });
 			SendModEvent("act", number);
+		});
+		// 0.14.62 : le nom de famille tape dans la page de la maison : ModEvent "AML_UIAction" ("name:<texte>", 3930)
+		g_prisma->RegisterJSListener(g_view, "amlText", [](const char* a_arg) {
+			auto text = ToGameText(a_arg);
+			SKSE::GetTaskInterface()->AddTask([]() { CloseView(); });
+			SendModEvent("name:" + text, 3930.0f);
 		});
 		g_prisma->RegisterJSListener(g_view, "amlClose", [](const char*) {
 			SKSE::GetTaskInterface()->AddTask([]() { CloseView(); });
@@ -243,6 +270,148 @@ namespace
 		return beds;
 	}
 
+	// ---------------------------------------------------------------- 0.14.32 : essai "Bless Home partout" (Estate 0.6)
+	// Un lieu garde la liste de ses reperes types (LCSR : type, reference, cellule ; une reference d'interieur a la case 0x7FFF7FFF,
+	// lu dans Breezehome et Riverwood Keep par work\diag_lcsr.py). La quete de planning de l'adoption remplit ses alias par ces types.
+	// On ajoute nos reperes a cette liste ; elle n'est pas sauvegardee : Estate les redonne a chaque chargement.
+	bool AddLocationRef(RE::StaticFunctionTag*, RE::BGSLocation* a_loc, RE::TESObjectREFR* a_ref, RE::BGSLocationRefType* a_type)
+	{
+		if (!a_loc || !a_ref || !a_type) {
+			return false;
+		}
+		const auto cell = a_ref->GetParentCell();
+		if (!cell) {
+			return false;
+		}
+		const auto id = a_ref->GetFormID();
+		for (auto& special : a_loc->specialRefs) {
+			if (special.refData.refID == id) {
+				special.type = a_type;
+				return true;
+			}
+		}
+		RE::SpecialRefData data{};
+		data.type = a_type;
+		data.refData.refID = id;
+		if (cell->IsInteriorCell()) {
+			data.refData.parentSpaceID = cell->GetFormID();
+			data.refData.cellKey.raw = 0x7FFF7FFF;
+		} else {
+			const auto world = a_ref->GetWorldspace();
+			data.refData.parentSpaceID = world ? world->GetFormID() : 0;
+			const auto coords = cell->GetCoordinates();
+			data.refData.cellKey.xy.first = coords ? static_cast<std::int16_t>(coords->cellY) : 0;
+			data.refData.cellKey.xy.second = coords ? static_cast<std::int16_t>(coords->cellX) : 0;
+		}
+		a_loc->specialRefs.push_back(data);
+		logger::info("lieu {:08X} : repere {:08X} type {:08X} ajoute", a_loc->GetFormID(), id, a_type->GetFormID());
+		return true;
+	}
+
+	RE::BGSLocation* ParentLocation(RE::StaticFunctionTag*, RE::BGSLocation* a_loc)
+	{
+		return a_loc ? a_loc->parentLoc : nullptr;
+	}
+
+	// ---------------------------------------------------------------- 0.14.50 : le scan d'une maison (Estate 0.10)
+	// Ce qu'une piece offre a un foyer, reconnu par les mots-cles et les drapeaux du meuble (regle lue dans Skyrim.esm et HearthFires.esm
+	// par work\diag_furniture_kinds.py) : 1 cuisine (marmite, broche, four), 2 siege, 3 bureau ou comptoir, 4 etabli, 5 billot a bois,
+	// 6 repere d'animation (balai...), 7 porte qui mene ailleurs. 0 = rien de cela. Jamais un lit.
+	std::int32_t SpotKind(RE::TESObjectREFR* a_ref)
+	{
+		if (!a_ref || a_ref->IsDisabled() || a_ref->IsDeleted()) {
+			return 0;
+		}
+		const auto base = a_ref->GetBaseObject();
+		if (!base) {
+			return 0;
+		}
+		if (base->Is(RE::FormType::Door)) {
+			const auto tele = a_ref->extraList.GetByType<RE::ExtraTeleport>();
+			return tele && tele->teleportData && tele->teleportData->linkedDoor.get() ? 7 : 0;
+		}
+		if (base->Is(RE::FormType::IdleMarker)) {
+			return 6;
+		}
+		const auto f = base->As<RE::TESFurniture>();
+		if (!f || f->furnFlags.all(RE::TESFurniture::ActiveMarker::kCanSleep)) {
+			return 0;
+		}
+		const auto has = [f](std::string_view a_word) { return f->HasKeywordString(a_word); };
+		if (has("CraftingCookpot") || has("BYOHCraftingOven") || has("isCraftingOven")) {
+			return 1;
+		}
+		if (has("FurnitureWoodChoppingBlock")) {
+			return 5;
+		}
+		if (has("isWritingChair") || has("isWritingTable") || has("FurnitureCounterLeanMarker") || has("isHadvarWriteLedger")) {
+			return 3;
+		}
+		if (has("BYOHCarpenterTable") || has("BYOHBuildingDrafting") || has("BYOHBuildingTrophyBase1") || has("BYOHBuildingTrophyBase2")) {
+			return 0;  // les etablis de construction de Hearthfire
+		}
+		using Bench = RE::TESFurniture::WorkBenchData::BenchType;
+		const auto bench = f->workBenchData.benchType.get();
+		if (bench == Bench::kSmithingWeapon || bench == Bench::kSmithingArmor || bench == Bench::kEnchanting || bench == Bench::kAlchemy ||
+			has("CraftingSmithingForge") || has("CraftingTanningRack") || has("CraftingSmelter")) {
+			return 4;
+		}
+		if (bench != Bench::kNone) {
+			return 0;
+		}
+		if (f->furnFlags.all(RE::TESFurniture::ActiveMarker::kCanSit) && !has("FurnitureSpecial") && !has("FurnitureForce3rdPerson")) {
+			return 2;
+		}
+		return 0;
+	}
+
+	// ce que la piece (ou la case du dehors) ou se tient cette personne offre, pour une sorte donnee ; 64 au plus
+	std::vector<RE::TESObjectREFR*> SpotsHere(RE::StaticFunctionTag*, RE::Actor* a_who, std::int32_t a_kind)
+	{
+		std::vector<RE::TESObjectREFR*> spots;
+		const auto cell = a_who ? a_who->GetParentCell() : nullptr;
+		if (!cell || a_kind < 1 || a_kind > 7) {
+			return spots;
+		}
+		cell->ForEachReference([&](RE::TESObjectREFR* a_ref) {
+			if (SpotKind(a_ref) == a_kind) {
+				spots.push_back(a_ref);
+			}
+			return spots.size() < 64 ? RE::BSContainer::ForEachResult::kContinue : RE::BSContainer::ForEachResult::kStop;
+		});
+		logger::info("scan de {:08X}, sorte {} : {}", cell->GetFormID(), a_kind, spots.size());
+		return spots;
+	}
+
+	RE::DoorTeleportData* TeleportOf(RE::TESObjectREFR* a_door)
+	{
+		if (!a_door) {
+			return nullptr;
+		}
+		const auto tele = a_door->extraList.GetByType<RE::ExtraTeleport>();
+		return tele ? tele->teleportData : nullptr;
+	}
+
+	// la porte de l'autre cote d'une porte qui mene ailleurs
+	RE::TESObjectREFR* DoorOther(RE::StaticFunctionTag*, RE::TESObjectREFR* a_door)
+	{
+		const auto data = TeleportOf(a_door);
+		return data ? data->linkedDoor.get().get() : nullptr;
+	}
+
+	// ou l'on arrive en passant cette porte : x, y, z, angle (degres) ; vide si ce n'est pas une porte qui mene ailleurs
+	std::vector<float> DoorArrival(RE::StaticFunctionTag*, RE::TESObjectREFR* a_door)
+	{
+		std::vector<float> out;
+		if (const auto data = TeleportOf(a_door)) {
+			out.push_back(data->position.x);
+			out.push_back(data->position.y);
+			out.push_back(data->position.z);
+			out.push_back(data->rotation.z * 57.29578f);
+		}
+		return out;
+	}
+
 	bool RegisterFunctions(RE::BSScript::IVirtualMachine* a_vm)
 	{
 		// true : appelables sans attendre une image. Le script en fait des dizaines par conversation ; ces valeurs ont leur verrou.
@@ -257,6 +426,11 @@ namespace
 		a_vm->RegisterFunction("CloseUI", "AML_Native", CloseUI);
 		a_vm->RegisterFunction("BedsHere", "AML_Native", BedsHere);
 		a_vm->RegisterFunction("SleepSpots", "AML_Native", SleepSpots);
+		a_vm->RegisterFunction("AddLocationRef", "AML_Native", AddLocationRef);
+		a_vm->RegisterFunction("ParentLocation", "AML_Native", ParentLocation);
+		a_vm->RegisterFunction("SpotsHere", "AML_Native", SpotsHere);
+		a_vm->RegisterFunction("DoorOther", "AML_Native", DoorOther);
+		a_vm->RegisterFunction("DoorArrival", "AML_Native", DoorArrival);
 		return true;
 	}
 
